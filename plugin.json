@@ -1,0 +1,26 @@
+{
+  "name": "remote",
+  "displayName": "remote",
+  "type": "wasm",
+  "entry": "plugin.wasm",
+  "version": "0.2.0",
+  "minAppVersion": "0.1.21",
+  "description": "remote-description",
+  "settings": [
+    {
+      "type": "text",
+      "label": "servers (one per line: name URL)",
+      "key": "servers",
+      "default": ""
+    },
+    {
+      "type": "password",
+      "label": "API keys (one per line: name key)",
+      "key": "apiKeys",
+      "default": ""
+    }
+  ],
+  "permissions": {
+    "allowedHosts": ["*"]
+  }
+}

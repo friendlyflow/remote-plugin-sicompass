@@ -1,165 +1,210 @@
-//! Remote FFON provider — Rust port of `lib/lib_remote/remote.ts`.
+//! Remote, a sicompass WASM plugin: browse FFON served over HTTP.
 //!
-//! Fetches a JSON FFON tree from a remote HTTP server and exposes it as a
-//! sicompass provider. Each top-level object in the server response is wrapped
-//! with a `<link>` tag so the main app's existing link-navigation handles
-//! sub-navigation (no per-path fetching is needed here, matching the TS script
-//! behaviour).
+//! A server answers `GET <url>/root` with a JSON FFON array, and `GET
+//! <url>/<entry>` with the children of a top-level entry. Remote shows each
+//! server the user configured as a section of its own, fetches a level when it
+//! is opened, and sends the server's API key as a bearer token.
 //!
-//! ## Settings keys consumed via `on_setting_change`
+//! The servers are the user's, so the plugin asks for any server
+//! (`"allowedHosts": ["*"]`), which the Store shows before install and the user
+//! approves. The host still refuses internal addresses and honours robots.txt.
 //!
-//! - `"remoteUrl"` — base URL of the remote service (e.g. `https://example.com/api`)
-//! - `"apiKey"`    — optional Bearer token; omit or leave empty for unauthenticated access
+//! Configured in its settings section, one server per line:
 //!
-//! ## Config file schema (compatible with the C build)
-//!
-//! ```json
-//! {
-//!   "<provider-name>": {
-//!     "remoteUrl": "https://example.com/api",
-//!     "apiKey":    "optional-bearer-token"
-//!   }
-//! }
+//! ```text
+//! servers:  products https://ffon.example/api
+//!           wiki https://wiki.example
+//! API keys: products the-token
 //! ```
+//!
+//! It was a built-in of the sicompass app (`lib/lib_remote`, a provider per
+//! server, before that a TypeScript script). [`Remote`] is the tree logic,
+//! tested natively; [`RemotePlugin`] connects it to the plugin interface.
 
+use std::collections::HashMap;
+
+use sicompass_pdk::{Descriptor, Plugin, export_plugin, host, net};
 use sicompass_sdk::ffon::{FfonElement, parse_json_value};
-use sicompass_sdk::provider::Provider;
 
-// ---------------------------------------------------------------------------
-// RemoteProvider
-// ---------------------------------------------------------------------------
+/// `GET url` with an optional bearer key: `(status, body)`, or why not.
+pub type Get = Box<dyn Fn(&str, &str) -> Result<(u16, Vec<u8>), String>>;
 
-pub struct RemoteProvider {
-    /// Provider name — also used as the settings section name.
-    name: String,
-    remote_url: String,
-    api_key: String,
-    current_path: String,
-    /// Cached root fetch (cleared when remoteUrl changes).
-    cached_root: Option<Vec<FfonElement>>,
+/// One configured server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Server {
+    pub name: String,
+    pub url: String,
+    pub key: String,
 }
 
-impl RemoteProvider {
-    /// Create a new provider with a known URL and API key.
-    ///
-    /// Pass empty strings for `remote_url` / `api_key` when neither is known
-    /// yet; they will be populated via `on_setting_change` during `init()`.
-    pub fn new(name: &str, remote_url: String, api_key: String) -> Self {
-        RemoteProvider {
-            name: name.to_owned(),
-            remote_url,
-            api_key,
-            current_path: "/".to_owned(),
-            cached_root: None,
+/// Parse the two settings: `name URL` and `name key`, one per line. Blank
+/// lines and lines starting with `#` are skipped, and so is a line without a
+/// URL. A key for a name with no server is ignored.
+pub fn parse_servers(servers: &str, keys: &str) -> Vec<Server> {
+    let pairs = |text: &str| -> Vec<(String, String)> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| {
+                let (name, rest) = l.split_once(char::is_whitespace)?;
+                let rest = rest.trim();
+                (!rest.is_empty()).then(|| (name.to_owned(), rest.to_owned()))
+            })
+            .collect()
+    };
+    let keys: HashMap<String, String> = pairs(keys).into_iter().collect();
+    pairs(servers)
+        .into_iter()
+        .map(|(name, url)| Server {
+            key: keys.get(&name).cloned().unwrap_or_default(),
+            url: url.trim_end_matches('/').to_owned(),
+            name,
+        })
+        .collect()
+}
+
+/// The tree: the servers, their root lists, and their entries' pages.
+pub struct Remote {
+    path: String,
+    servers: Vec<Server>,
+    /// Pages by URL, kept until the settings change or `refresh`.
+    cache: HashMap<String, Vec<FfonElement>>,
+    get: Get,
+    /// Shown at the root when no server is configured (translated by the host).
+    pub no_servers_text: String,
+}
+
+impl Remote {
+    pub fn new(get: Get) -> Self {
+        Remote {
+            path: "/".to_owned(),
+            servers: Vec::new(),
+            cache: HashMap::new(),
+            get,
+            no_servers_text: "No servers yet. Add one in Settings, under remote, as a line: \
+                              name URL"
+                .to_owned(),
         }
     }
 
-    /// Perform a blocking GET request and return the parsed FFON elements.
-    fn fetch_from_server(&self) -> Vec<FfonElement> {
-        if self.remote_url.is_empty() {
-            return vec![FfonElement::new_str(format!(
-                "No remote URL configured for \"{}\"",
-                self.name
-            ))];
+    /// Take the current settings. A change forgets every fetched page.
+    pub fn set_config(&mut self, servers: &str, keys: &str) {
+        let servers = parse_servers(servers, keys);
+        if servers != self.servers {
+            self.servers = servers;
+            self.cache.clear();
         }
+    }
 
-        let root_url = format!("{}/root", self.remote_url.trim_end_matches('/'));
+    pub fn servers(&self) -> &[Server] {
+        &self.servers
+    }
 
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return vec![FfonElement::new_str(format!(
-                    "Error building HTTP client: {e}"
-                ))];
-            }
-        };
+    /// Forget every fetched page.
+    pub fn refresh(&mut self) {
+        self.cache.clear();
+    }
 
-        let mut req = client.get(&root_url).header("Accept", "application/json");
-        if !self.api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", self.api_key));
+    pub fn current_path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn set_current_path(&mut self, path: &str) {
+        self.path = path.to_owned();
+    }
+
+    pub fn push_path(&mut self, segment: &str) {
+        if self.path == "/" {
+            self.path = format!("/{segment}");
+        } else {
+            self.path.push('/');
+            self.path.push_str(segment);
         }
+    }
 
-        let response = match req.send() {
-            Ok(r) => r,
-            Err(e) => {
-                return vec![FfonElement::new_str(format!(
-                    "Error connecting to {}: {}",
-                    self.remote_url, e
-                ))];
-            }
-        };
-
-        if !response.status().is_success() {
-            return vec![FfonElement::new_str(format!(
-                "Failed to fetch from {}: {} {}",
-                self.remote_url,
-                response.status().as_u16(),
-                response.status().canonical_reason().unwrap_or("")
-            ))];
+    pub fn pop_path(&mut self) {
+        match self.path.rfind('/') {
+            Some(0) | None => self.path = "/".to_owned(),
+            Some(i) => self.path.truncate(i),
         }
+    }
 
-        let body = match response.text() {
-            Ok(t) => t,
-            Err(e) => {
-                return vec![FfonElement::new_str(format!(
-                    "Error reading response from {}: {e}",
-                    self.remote_url
-                ))];
+    pub fn fetch(&mut self) -> Vec<FfonElement> {
+        let parts: Vec<String> = self
+            .path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let Some((name, rest)) = parts.split_first() else {
+            if self.servers.is_empty() {
+                return vec![FfonElement::new_str(self.no_servers_text.clone())];
             }
+            return self
+                .servers
+                .iter()
+                .map(|s| FfonElement::new_obj(s.name.clone()))
+                .collect();
         };
-
-        let arr = match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(serde_json::Value::Array(a)) => a,
-            Ok(_) => {
-                return vec![FfonElement::new_str(format!(
-                    "Invalid response from {}",
-                    self.remote_url
-                ))];
-            }
-            Err(e) => {
-                return vec![FfonElement::new_str(format!(
-                    "Invalid JSON from {}: {e}",
-                    self.remote_url
-                ))];
-            }
+        let Some(server) = self.servers.iter().find(|s| &s.name == name).cloned() else {
+            return Vec::new();
         };
+        let result = match rest.split_first() {
+            // The server's own list: each top-level entry opens lazily.
+            None => self.page(&server, "root").map(|items| {
+                items
+                    .into_iter()
+                    .map(|e| match e {
+                        FfonElement::Obj(o) if !sicompass_sdk::tags::has_link(&o.key) => {
+                            FfonElement::new_obj(o.key)
+                        }
+                        other => other,
+                    })
+                    .collect()
+            }),
+            // An entry's page, then down its children by key.
+            Some((entry, deeper)) => self.page(&server, &url_encode(entry)).map(|mut level| {
+                for segment in deeper {
+                    let next = level.into_iter().find_map(|e| match e {
+                        FfonElement::Obj(o)
+                            if sicompass_sdk::tags::strip_display(&o.key) == segment.as_str() =>
+                        {
+                            Some(o.children)
+                        }
+                        _ => None,
+                    });
+                    level = next.unwrap_or_default();
+                }
+                level
+            }),
+        };
+        result.unwrap_or_else(|e| vec![FfonElement::new_str(e)])
+    }
 
-        // Wrap each top-level object with a <link> tag for lazy sub-navigation,
-        // matching wrapWithLinks() in remote.ts.
-        let base = self.remote_url.trim_end_matches('/');
-        arr.iter().map(|v| wrap_with_link(v, base)).collect()
+    /// `GET <server>/<rel>`, parsed, from the cache when it is there. Errors
+    /// are not cached, so the next look tries again.
+    fn page(&mut self, server: &Server, rel: &str) -> Result<Vec<FfonElement>, String> {
+        let url = format!("{}/{rel}", server.url);
+        if let Some(cached) = self.cache.get(&url) {
+            return Ok(cached.clone());
+        }
+        let (status, body) = (self.get)(&url, &server.key)
+            .map_err(|e| format!("Error connecting to {}: {e}", server.url))?;
+        if !(200..300).contains(&status) {
+            return Err(format!("Failed to fetch from {}: {status}", server.url));
+        }
+        let items = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(serde_json::Value::Array(items)) => items,
+            _ => return Err(format!("Invalid response from {}", server.url)),
+        };
+        let elements: Vec<FfonElement> = items.iter().map(parse_json_value).collect();
+        self.cache.insert(url, elements.clone());
+        Ok(elements)
     }
 }
 
-/// Wrap a top-level JSON value with a `<link>` tag on its object key,
-/// mirroring `wrapWithLinks` in remote.ts.
-///
-/// - Strings are passed through as-is.
-/// - Objects whose key already contains `<link>` are passed through.
-/// - Other objects get `<link>{base_url}/{url-encoded key}</link>{key}` as
-///   their key, and an empty children list (sub-nav is handled by the link
-///   resolver in the main binary, not fetched here).
-fn wrap_with_link(v: &serde_json::Value, base_url: &str) -> FfonElement {
-    if let serde_json::Value::Object(map) = v {
-        if let Some((key, _)) = map.iter().next() {
-            if key.contains("<link>") {
-                // Already wrapped — delegate to the standard parser.
-                return parse_json_value(v);
-            }
-            let encoded_key = url_encode(key);
-            let link_key = format!("<link>{base_url}/{encoded_key}</link>{key}");
-            // Return an empty object — children are fetched lazily via the link.
-            return FfonElement::new_obj(link_key);
-        }
-    }
-    parse_json_value(v)
-}
-
-/// Minimal percent-encoding for path segments (RFC 3986 unreserved chars are
-/// left as-is; everything else is %-encoded). Mirrors encodeURIComponent in TS.
+/// Percent-encoding for one path segment: RFC 3986 unreserved characters and
+/// `!*'()` stay, everything else is encoded (as `encodeURIComponent`).
 fn url_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -175,271 +220,316 @@ fn url_encode(s: &str) -> String {
             | b'*'
             | b'\''
             | b'('
-            | b')' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(
-                    char::from_digit((b >> 4) as u32, 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
-                out.push(
-                    char::from_digit((b & 0xf) as u32, 16)
-                        .unwrap()
-                        .to_ascii_uppercase(),
-                );
-            }
+            | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
     out
 }
 
-impl Provider for RemoteProvider {
-    fn name(&self) -> &str {
-        &self.name
-    }
+// ---------------------------------------------------------------------------
+// The plugin
+// ---------------------------------------------------------------------------
 
-    fn display_name(&self) -> String {
-        self.name.clone()
-    }
+pub struct RemotePlugin {
+    remote: Remote,
+}
 
-    fn fetch(&mut self) -> Vec<FfonElement> {
-        if self.current_path != "/" {
-            // Sub-navigation is handled by the <link> resolver; we serve nothing here.
-            return Vec::new();
-        }
-        if let Some(cached) = &self.cached_root {
-            return cached.clone();
-        }
-        let result = self.fetch_from_server();
-        self.cached_root = Some(result.clone());
-        result
-    }
-
-    fn push_path(&mut self, segment: &str) {
-        if self.current_path == "/" {
-            self.current_path = format!("/{segment}");
-        } else {
-            self.current_path.push('/');
-            self.current_path.push_str(segment);
-        }
-    }
-
-    fn pop_path(&mut self) {
-        if self.current_path == "/" {
-            return;
-        }
-        if let Some(slash) = self.current_path.rfind('/') {
-            if slash == 0 {
-                self.current_path = "/".to_owned();
-            } else {
-                self.current_path.truncate(slash);
-            }
-        }
-    }
-
-    fn current_path(&self) -> &str {
-        &self.current_path
-    }
-
-    fn on_setting_change(&mut self, key: &str, value: &str) {
-        match key {
-            "remoteUrl" => {
-                if self.remote_url != value {
-                    self.remote_url = value.to_owned();
-                    self.cached_root = None; // invalidate cache
-                }
-            }
-            "apiKey" => {
-                self.api_key = value.to_owned();
-            }
-            _ => {}
-        }
+impl RemotePlugin {
+    /// Read the servers from this plugin's settings section.
+    fn load_config(&mut self) {
+        let servers = host::get_setting("servers").unwrap_or_default();
+        let keys = host::get_setting("apiKeys").unwrap_or_default();
+        self.remote.set_config(&servers, &keys);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+fn net_get(url: &str, key: &str) -> Result<(u16, Vec<u8>), String> {
+    let mut headers = vec![("Accept".to_owned(), "application/json".to_owned())];
+    if !key.is_empty() {
+        headers.push(("Authorization".to_owned(), format!("Bearer {key}")));
+    }
+    let resp = net::fetch(&net::HttpRequest {
+        method: "GET".to_owned(),
+        url: url.to_owned(),
+        headers,
+        body: None,
+    })?;
+    Ok((resp.status, resp.body))
+}
 
-// Strategy: wiremock requires an async runtime to start the server. We create
-// a fresh tokio::runtime::Runtime per test, use it only to start the server
-// and register mocks, then drop out to sync context before calling any
-// blocking reqwest code. This avoids the "cannot drop runtime in async context"
-// panic that occurs when reqwest::blocking runs inside a tokio executor.
+impl Plugin for RemotePlugin {
+    fn new() -> Self {
+        RemotePlugin {
+            remote: Remote::new(Box::new(net_get)),
+        }
+    }
+
+    fn init(&mut self) {
+        self.remote.no_servers_text = host::translate("remote-no-servers");
+        self.load_config();
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: "remote".to_owned(),
+            display_name: host::translate("remote-display-name"),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn fetch(&mut self) -> Vec<FfonElement> {
+        self.remote.fetch()
+    }
+
+    fn current_path(&self) -> &str {
+        self.remote.current_path()
+    }
+
+    fn set_current_path(&mut self, path: &str) {
+        self.remote.set_current_path(path);
+    }
+
+    fn push_path(&mut self, segment: &str) {
+        self.remote.push_path(segment);
+    }
+
+    fn pop_path(&mut self) {
+        self.remote.pop_path();
+    }
+
+    fn on_setting_change(&mut self, key: &str, _value: &str) {
+        if key == "servers" || key == "apiKeys" {
+            self.load_config();
+        }
+    }
+
+    /// F5 (and the `refresh` command): fetch again.
+    fn commands(&self) -> Vec<String> {
+        vec!["refresh".to_owned()]
+    }
+
+    fn handle_command(
+        &mut self,
+        cmd: &str,
+        _elem_key: &str,
+        _elem_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        if cmd == "refresh" {
+            self.load_config();
+            self.remote.refresh();
+        }
+        Ok(None)
+    }
+}
+
+export_plugin!(RemotePlugin);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
-    fn start_mock_server() -> (tokio::runtime::Runtime, MockServer) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let server = rt.block_on(MockServer::start());
-        (rt, server)
+    type Log = Rc<RefCell<Vec<(String, String)>>>;
+
+    /// A fake server: `routes` maps a URL to `(status, body)`; every request is
+    /// logged with the key it carried.
+    fn remote(routes: &[(&str, u16, &str)]) -> (Remote, Log) {
+        let routes: HashMap<String, (u16, String)> = routes
+            .iter()
+            .map(|(u, s, b)| (u.to_string(), (*s, b.to_string())))
+            .collect();
+        let log: Log = Rc::default();
+        let sink = log.clone();
+        let get: Get = Box::new(move |url, key| {
+            sink.borrow_mut().push((url.to_owned(), key.to_owned()));
+            routes
+                .get(url)
+                .map(|(s, b)| (*s, b.clone().into_bytes()))
+                .ok_or_else(|| "connection refused".to_owned())
+        });
+        (Remote::new(get), log)
     }
 
-    fn mount(rt: &tokio::runtime::Runtime, server: &MockServer, mock: Mock) {
-        rt.block_on(mock.mount(server));
+    fn keys(e: &[FfonElement]) -> Vec<String> {
+        e.iter()
+            .map(|e| match e {
+                FfonElement::Str(s) => s.clone(),
+                FfonElement::Obj(o) => o.key.clone(),
+            })
+            .collect()
     }
 
     #[test]
-    fn fetch_success_wraps_objects_with_link_tags() {
-        let (rt, server) = start_mock_server();
-        mount(
-            &rt,
-            &server,
-            Mock::given(method("GET")).and(path("/root")).respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                    { "Products": [] },
-                    "plain string item",
-                ])),
-            ),
+    fn servers_and_keys_parse_one_per_line() {
+        let s = parse_servers(
+            "products https://ffon.example/api/\n\n# a comment\nwiki  https://wiki.example\nbroken",
+            "products tok\nghost nobody",
         );
+        assert_eq!(
+            s,
+            vec![
+                Server {
+                    name: "products".into(),
+                    url: "https://ffon.example/api".into(),
+                    key: "tok".into()
+                },
+                Server {
+                    name: "wiki".into(),
+                    url: "https://wiki.example".into(),
+                    key: String::new()
+                },
+            ]
+        );
+    }
 
-        let base_url = server.uri();
-        let mut p = RemoteProvider::new("mysvc", base_url.clone(), String::new());
-        let items = p.fetch();
+    #[test]
+    fn no_servers_says_how_to_add_one() {
+        let (mut r, log) = remote(&[]);
+        assert_eq!(keys(&r.fetch()), vec![r.no_servers_text.clone()]);
+        assert!(log.borrow().is_empty());
+    }
 
-        // Expect 2 elements
-        assert_eq!(items.len(), 2, "should have 2 items, got: {items:?}");
+    #[test]
+    fn the_root_lists_the_servers_without_fetching() {
+        let (mut r, log) = remote(&[]);
+        r.set_config("a https://a.example\nb https://b.example", "");
+        assert_eq!(keys(&r.fetch()), vec!["a", "b"]);
+        assert!(log.borrow().is_empty());
+    }
 
-        // First item: "Products" should be wrapped with a <link> tag
-        let first_key = match &items[0] {
-            FfonElement::Obj(o) => o.key.clone(),
-            other => panic!("expected Obj, got {other:?}"),
+    /// Ported from `fetch_success_wraps_objects_with_link_tags`: top-level
+    /// entries open lazily (then per path, not through `<link>`), strings pass
+    /// through, and an entry that already is a link stays one.
+    #[test]
+    fn a_servers_list_opens_its_entries_lazily() {
+        let (mut r, _) = remote(&[(
+            "https://s.example/root",
+            200,
+            r#"["hello", {"Products": ["x"]}, {"Docs <link>https://d.example</link>": []}]"#,
+        )]);
+        r.set_config("s https://s.example", "");
+        r.push_path("s");
+        let items = r.fetch();
+        assert_eq!(
+            keys(&items),
+            vec!["hello", "Products", "Docs <link>https://d.example</link>"]
+        );
+        let FfonElement::Obj(products) = &items[1] else {
+            panic!()
         };
-        assert!(
-            first_key.contains("<link>") && first_key.contains("Products"),
-            "expected <link> tag wrapping 'Products', got: {first_key}"
-        );
-        assert!(
-            first_key.contains(&base_url),
-            "link key should contain server URL, got: {first_key}"
-        );
-
-        // Second item: plain string passes through
-        assert_eq!(items[1], FfonElement::Str("plain string item".to_owned()));
+        assert!(products.children.is_empty(), "opened lazily");
     }
 
     #[test]
-    fn fetch_bearer_auth_header_sent_when_api_key_set() {
-        let (rt, server) = start_mock_server();
-        mount(
-            &rt,
-            &server,
-            Mock::given(method("GET"))
-                .and(path("/root"))
-                .and(header("Authorization", "Bearer secret123"))
-                .respond_with(
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!(["item"])),
-                ),
-        );
-
-        let mut p = RemoteProvider::new("mysvc", server.uri(), "secret123".to_owned());
-        let items = p.fetch();
-        assert_eq!(items, vec![FfonElement::Str("item".to_owned())]);
-    }
-
-    #[test]
-    fn fetch_non_200_returns_error_string() {
-        let (rt, server) = start_mock_server();
-        mount(
-            &rt,
-            &server,
-            Mock::given(method("GET"))
-                .and(path("/root"))
-                .respond_with(ResponseTemplate::new(401)),
-        );
-
-        let mut p = RemoteProvider::new("mysvc", server.uri(), String::new());
-        let items = p.fetch();
-
-        assert_eq!(items.len(), 1);
-        let msg = match &items[0] {
-            FfonElement::Str(s) => s.clone(),
-            other => panic!("expected Str error, got {other:?}"),
-        };
-        assert!(
-            msg.contains("401") || msg.contains("Failed"),
-            "expected 401/Failed in error message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn fetch_no_url_returns_not_configured_message() {
-        let mut p = RemoteProvider::new("mysvc", String::new(), String::new());
-        let items = p.fetch();
-        assert_eq!(items.len(), 1);
-        let msg = items[0].as_str().unwrap_or("");
-        assert!(
-            msg.contains("No remote URL"),
-            "expected 'No remote URL' message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn on_setting_change_remote_url_invalidates_cache() {
-        let (rt, server) = start_mock_server();
-        mount(
-            &rt,
-            &server,
-            Mock::given(method("GET")).and(path("/root")).respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!(["item"])),
+    fn an_entry_is_its_own_page_and_deeper_levels_walk_it() {
+        let (mut r, log) = remote(&[
+            ("https://s.example/root", 200, r#"[{"My Products": []}]"#),
+            (
+                "https://s.example/My%20Products",
+                200,
+                r#"["one", {"Two": ["deep"]}]"#,
             ),
-        );
+        ]);
+        r.set_config("s https://s.example", "");
+        r.set_current_path("/s/My Products");
+        assert_eq!(keys(&r.fetch()), vec!["one", "Two"]);
+        r.push_path("Two");
+        assert_eq!(keys(&r.fetch()), vec!["deep"]);
+        // The page was fetched once for both levels.
+        let fetched: Vec<String> = log.borrow().iter().map(|(u, _)| u.clone()).collect();
+        assert_eq!(fetched, vec!["https://s.example/My%20Products"]);
+    }
 
-        let mut p = RemoteProvider::new("mysvc", server.uri(), String::new());
-        let _ = p.fetch(); // populate cache
-        assert!(p.cached_root.is_some());
-
-        p.on_setting_change("remoteUrl", "https://other.example.com");
-        assert!(
-            p.cached_root.is_none(),
-            "cache should be cleared after remoteUrl change"
+    /// Ported from `fetch_bearer_auth_header_sent_when_api_key_set`.
+    #[test]
+    fn a_servers_key_goes_with_every_request_to_it() {
+        let (mut r, log) = remote(&[
+            ("https://s.example/root", 200, "[]"),
+            ("https://t.example/root", 200, "[]"),
+        ]);
+        r.set_config("s https://s.example\nt https://t.example", "s secret123");
+        r.set_current_path("/s");
+        r.fetch();
+        r.set_current_path("/t");
+        r.fetch();
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                ("https://s.example/root".to_owned(), "secret123".to_owned()),
+                ("https://t.example/root".to_owned(), String::new()),
+            ]
         );
-        assert_eq!(p.remote_url, "https://other.example.com");
+    }
+
+    /// Ported from `fetch_non_200_returns_error_string`.
+    #[test]
+    fn a_failed_request_says_so_and_is_tried_again() {
+        let (mut r, log) = remote(&[("https://s.example/root", 503, "")]);
+        r.set_config("s https://s.example", "");
+        r.set_current_path("/s");
+        let line = keys(&r.fetch()).join("");
+        assert!(line.contains("503") && line.contains("s.example"), "{line}");
+        r.fetch();
+        assert_eq!(log.borrow().len(), 2, "errors are not cached");
     }
 
     #[test]
-    fn on_setting_change_api_key_stores_value() {
-        let mut p = RemoteProvider::new("mysvc", String::new(), String::new());
-        p.on_setting_change("apiKey", "newkey");
-        assert_eq!(p.api_key, "newkey");
+    fn an_unreachable_server_and_a_non_list_answer_are_reported() {
+        let (mut r, _) = remote(&[("https://s.example/root", 200, r#"{"not": "a list"}"#)]);
+        r.set_config("s https://s.example\ngone https://gone.example", "");
+        r.set_current_path("/s");
+        assert!(keys(&r.fetch())[0].starts_with("Invalid response"));
+        r.set_current_path("/gone");
+        assert!(keys(&r.fetch())[0].starts_with("Error connecting"));
+    }
+
+    /// Ported from `on_setting_change_remote_url_invalidates_cache`.
+    #[test]
+    fn changing_the_servers_forgets_fetched_pages_and_refresh_does_too() {
+        let (mut r, log) = remote(&[
+            ("https://s.example/root", 200, "[]"),
+            ("https://other.example/root", 200, "[]"),
+        ]);
+        r.set_config("s https://s.example", "");
+        r.set_current_path("/s");
+        r.fetch();
+        r.fetch();
+        assert_eq!(log.borrow().len(), 1, "cached");
+        r.set_config("s https://other.example", "");
+        r.fetch();
+        r.refresh();
+        r.fetch();
+        let fetched: Vec<String> = log.borrow().iter().map(|(u, _)| u.clone()).collect();
+        assert_eq!(
+            fetched,
+            vec![
+                "https://s.example/root",
+                "https://other.example/root",
+                "https://other.example/root"
+            ]
+        );
     }
 
     #[test]
     fn url_encode_spaces_and_slashes() {
-        assert_eq!(url_encode("hello world"), "hello%20world");
+        assert_eq!(url_encode("My Products"), "My%20Products");
         assert_eq!(url_encode("a/b"), "a%2Fb");
-        assert_eq!(url_encode("abc"), "abc");
+        assert_eq!(url_encode("safe-_.~!*'()"), "safe-_.~!*'()");
+        assert_eq!(url_encode("é"), "%C3%A9");
     }
-}
 
-// ---------------------------------------------------------------------------
-// SDK registration
-// ---------------------------------------------------------------------------
-
-/// Instantiate a `RemoteProvider` for a named remote service.
-///
-/// `RemoteProvider` requires `(name, url, api_key)` at construction time and
-/// cannot fit the zero-arg factory signature, so this helper is called
-/// directly by `sicompass_builtins` and by the app's `load_remote_programs`.
-pub fn create_remote(
-    name: &str,
-    remote_url: String,
-    api_key: String,
-) -> Box<dyn sicompass_sdk::Provider> {
-    Box::new(RemoteProvider::new(name, remote_url, api_key))
-}
-
-/// Register the remote provider with the SDK manifest registry (no zero-arg
-/// factory — use [`create_remote`] to instantiate).
-pub fn register() {
-    // RemoteProvider is per-service, not a single named factory; only the
-    // manifest type info is registered so the app can recognise remote entries.
-    // Instantiation goes through create_remote().
+    #[test]
+    fn navigation_pushes_and_pops() {
+        let (mut r, _) = remote(&[]);
+        r.push_path("s");
+        r.push_path("x");
+        assert_eq!(r.current_path(), "/s/x");
+        r.pop_path();
+        r.pop_path();
+        r.pop_path();
+        assert_eq!(r.current_path(), "/");
+    }
 }
