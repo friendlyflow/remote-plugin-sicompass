@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Remote for sicompass: browse FFON served over HTTP, as a WASM plugin"
-repository = "https://github.com/friendlyflow/remote_plugin_sicompass"
+repository = "https://github.com/friendlyflow/remote-plugin-sicompass"
 # A plugin ships as a signed release the sicompass Store installs, never on crates.io.
 publish = false
 

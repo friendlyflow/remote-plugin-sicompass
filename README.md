@@ -1,4 +1,4 @@
-# remote_plugin_sicompass
+# remote-plugin-sicompass
 
 *Browse lists your own servers serve, in Sicompass.*
 
