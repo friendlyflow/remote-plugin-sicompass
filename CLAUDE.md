@@ -81,5 +81,6 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/remote.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK comes by git rev until it is on crates.io. The commented-out `[patch]`
-in `Cargo.toml` is for working on both together, and stays commented on main.
+The SDK and the pdk come from crates.io (the source is
+`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
+working on them together, and stays commented on main.
