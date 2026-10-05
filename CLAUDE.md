@@ -8,28 +8,32 @@ usually driven from a sicompass checkout next to this one (`../sicompass`), whos
 as their first argument and then follow the skills in this repo's
 `.claude/skills/`.
 
-It is a sicompass **WASM plugin**: a `cdylib` built for `wasm32-wasip2` with
-`sicompass-pdk`, installed by the sicompass Store from this repo's GitHub
-releases. It asks for any public server (`"allowedHosts": ["*"]`), because the
-servers are the user's: the Store shows that and the user approves it. The host
-refuses internal addresses and honours robots.txt regardless. The
-plugin platform is described in `../sicompass/docs/plugin-platform.md` and
-`../sicompass/docs/wasm-plugins.md`.
+It is a sicompass **plugin process**: a program (`src/main.rs`) built with the
+SDK's `plugin` feature, which sicompass starts and talks to over its stdin and
+stdout. It runs with the user's rights. The Store installs it from this repo's
+GitHub releases, one build per platform. It declares that it reaches any server
+(`"allowedHosts": ["*"]`), because the servers are the user's: the Store shows
+that and the user approves it. It connects only to the servers the user
+configured. The plugin platform is described in
+`../sicompass/docs/plugin-platform.md`.
 
 - `plugin.json` is the manifest. Its `name` (`remote`) is also the install
   folder and the settings section, and its `version` must equal the release tag.
   Settings: `servers` (one `name URL` per line) and `apiKeys` (password, one
   `name key` per line). sicompass migrates the old built-in's settings into them.
 - `locales/<lang>.ftl`, every id prefixed `remote-`, in all four languages.
-- `Remote` is the tree logic with an injected HTTP function, tested natively
-  with `cargo test`. `RemotePlugin` implements `sicompass_pdk::Plugin` on top
-  of it and fetches through the host's `net` interface.
+- `Remote` is the tree logic with an injected HTTP function, tested with
+  `cargo test`. `RemotePlugin` implements `sicompass_sdk::plugin::Plugin` on
+  top of it and fetches with its own HTTP client (`ureq` with rustls), and
+  `src/main.rs` makes it the program. A request has 8 seconds in all, under the
+  10 seconds the app gives every call.
 
 ## Environment (Nix)
 
 The toolchain comes from the flake dev shell in [flake.nix](flake.nix): Rust
-from rust-overlay with the `wasm32-wasip2` target (nixpkgs' rustc has no `std`
-for it), `wasm-tools` and `jq`. Nothing is installed system-wide.
+from rust-overlay with this computer's plugin target (static musl on Linux,
+which nixpkgs' rustc has no `std` for) and `jq`. Nothing is installed
+system-wide.
 
 - **Check once per session**, then stick with the answer: `command -v cargo`.
   - Non-empty: the shell is inside `nix develop`, so run `cargo ...` directly.
@@ -57,8 +61,8 @@ instead, or split into separate sentences.
 ## Testing
 
 - After implementing changes, always run the tests before finishing:
-  `cargo test` (natively), and `./scripts/release-plugin.sh --dry-run`, which
-  also builds the component and audits its imports.
+  `cargo test`, and `./scripts/release-plugin.sh --dry-run`, which also builds
+  this computer's release and verifies it the way the Store will.
 - When adding new code, write or update tests.
 - If tests fail, fix the code. Never leave a task with failing tests.
 
@@ -81,6 +85,10 @@ against the `PLUGIN_PUBLIC_KEY` variable, the key the sicompass store list
 names. The secret key file is `~/.config/sicompass/plugin-keys/remote.key`
 on the maintainer's machine. Never print, copy or commit it.
 
-The SDK and the pdk come from crates.io (the source is
-`../sicompass-plugin-sdk`). The commented-out `[patch]` in `Cargo.toml` is for
-working on them together, and stays commented on main.
+The SDK comes from crates.io (the source is `../sicompass-plugin-sdk`). The
+commented-out `[patch]` in `Cargo.toml` is for working on them together, and
+stays commented on main.
+
+A release has one archive per platform. The release workflow builds them on
+five runners (Linux x86_64 and arm64 as static musl, macOS arm64 and x86_64,
+Windows x86_64), then packs, signs and verifies them in one job.

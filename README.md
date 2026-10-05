@@ -16,8 +16,7 @@ bearer token.
 
 Because the servers are yours to choose, Remote asks for access to any server
 on the internet. The Store shows that before you install it, and installing it
-is your approval. It never reaches your own computer or your local network, and
-it honours each server's robots.txt.
+is your approval. It connects only to the servers you add.
 
 ## Install
 
@@ -25,24 +24,29 @@ In Sicompass, open store, then programs, and press Enter on install next to
 remote. The Store checks the release's signature before installing it, and
 keeps it up to date.
 
+To install a build of your own instead, copy `plugin.json`, the built
+`plugin` program (`plugin.exe` on Windows) and `locales/` into a folder named
+`remote` in the Sicompass plugins folder (`~/.config/sicompass/plugins/` on
+Linux, `~/Library/Application Support/sicompass/plugins/` on macOS) and restart
+Sicompass.
+
 ## Building from source
 
 ```bash
-nix develop          # the toolchain, with the wasm32-wasip2 target
-cargo test           # the tree logic, natively
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/remote_plugin.wasm plugin.wasm
+nix develop          # the toolchain
+cargo test           # the tree logic and the HTTP client
+cargo build --release
+cp target/release/remote-plugin plugin
 ```
 
-`./scripts/release-plugin.sh --dry-run` does the build, checks the component
-against `plugin.json`, and signs and verifies it with a throwaway key, the way
-a release is made.
+`./scripts/release-plugin.sh --dry-run` builds this computer's release, packs
+it, and signs and verifies it with a throwaway key, the way a release is made.
 
 ## Related repositories
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK and the WASM plugin kit
+  the SDK and the plugin kit
 
 ## Community
 

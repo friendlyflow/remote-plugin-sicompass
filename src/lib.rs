@@ -1,13 +1,14 @@
-//! Remote, a sicompass WASM plugin: browse FFON served over HTTP.
+//! Remote, a sicompass plugin: browse FFON served over HTTP.
 //!
 //! A server answers `GET <url>/root` with a JSON FFON array, and `GET
 //! <url>/<entry>` with the children of a top-level entry. Remote shows each
 //! server the user configured as a section of its own, fetches a level when it
 //! is opened, and sends the server's API key as a bearer token.
 //!
-//! The servers are the user's, so the plugin asks for any server
-//! (`"allowedHosts": ["*"]`), which the Store shows before install and the user
-//! approves. The host still refuses internal addresses and honours robots.txt.
+//! The servers are the user's, so the plugin declares that it reaches any
+//! server (`"allowedHosts": ["*"]`), which the Store shows before install and
+//! the user approves. It connects to the servers the user configured and to
+//! nothing else.
 //!
 //! Configured in its settings section, one server per line:
 //!
@@ -19,12 +20,20 @@
 //!
 //! It was a built-in of the sicompass app (`lib/lib_remote`, a provider per
 //! server, before that a TypeScript script). [`Remote`] is the tree logic,
-//! tested natively; [`RemotePlugin`] connects it to the plugin interface.
+//! tested with `cargo test`; [`RemotePlugin`] connects it to the plugin
+//! interface and fetches with its own HTTP client, and `src/main.rs` makes it
+//! the program.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use sicompass_pdk::{Descriptor, Plugin, export_plugin, host, net};
 use sicompass_sdk::ffon::{FfonElement, parse_json_value};
+use sicompass_sdk::plugin::{Descriptor, Plugin, host};
+
+/// How long one request may take, all of it. The app gives up on a call after
+/// 10 seconds and ends the plugin, and a fetch makes at most one request, so
+/// a server that hangs costs an error row instead of the plugin.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// `GET url` with an optional bearer key: `(status, body)`, or why not.
 pub type Get = Box<dyn Fn(&str, &str) -> Result<(u16, Vec<u8>), String>>;
@@ -244,24 +253,37 @@ impl RemotePlugin {
     }
 }
 
-fn net_get(url: &str, key: &str) -> Result<(u16, Vec<u8>), String> {
-    let mut headers = vec![("Accept".to_owned(), "application/json".to_owned())];
+/// The HTTP client every request goes through. An error status is an answer
+/// (the tree reports it with its code), not a failure to connect.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+/// `GET url` with `Accept: application/json`, and the key as a bearer token
+/// when there is one.
+fn http_get(agent: &ureq::Agent, url: &str, key: &str) -> Result<(u16, Vec<u8>), String> {
+    let mut request = agent.get(url).header("Accept", "application/json");
     if !key.is_empty() {
-        headers.push(("Authorization".to_owned(), format!("Bearer {key}")));
+        request = request.header("Authorization", format!("Bearer {key}"));
     }
-    let resp = net::fetch(&net::HttpRequest {
-        method: "GET".to_owned(),
-        url: url.to_owned(),
-        headers,
-        body: None,
-    })?;
-    Ok((resp.status, resp.body))
+    let mut response = request.call().map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|e| e.to_string())?;
+    Ok((status, body))
 }
 
 impl Plugin for RemotePlugin {
     fn new() -> Self {
+        let agent = http_agent();
         RemotePlugin {
-            remote: Remote::new(Box::new(net_get)),
+            remote: Remote::new(Box::new(move |url, key| http_get(&agent, url, key))),
         }
     }
 
@@ -323,8 +345,6 @@ impl Plugin for RemotePlugin {
         Ok(None)
     }
 }
-
-export_plugin!(RemotePlugin);
 
 #[cfg(test)]
 mod tests {
@@ -519,6 +539,68 @@ mod tests {
         assert_eq!(url_encode("a/b"), "a%2Fb");
         assert_eq!(url_encode("safe-_.~!*'()"), "safe-_.~!*'()");
         assert_eq!(url_encode("é"), "%C3%A9");
+    }
+
+    /// A one-request HTTP server on a loopback port: answers with `status` and
+    /// `body`, and hands back the request it read.
+    fn serve_once(status: &str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let status = status.to_owned();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn the_http_client_sends_the_key_and_returns_status_and_body() {
+        let (url, server) = serve_once("200 OK", r#"["hello"]"#);
+        let (status, body) = http_get(&http_agent(), &format!("{url}/root"), "secret123").unwrap();
+        assert_eq!((status, body.as_slice()), (200, br#"["hello"]"#.as_slice()));
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /root http/1.1"), "{request}");
+        assert!(
+            request.contains("authorization: bearer secret123"),
+            "{request}"
+        );
+        assert!(request.contains("accept: application/json"), "{request}");
+    }
+
+    #[test]
+    fn the_http_client_answers_an_error_status_and_sends_no_empty_key() {
+        let (url, server) = serve_once("503 Service Unavailable", "");
+        let (status, body) = http_get(&http_agent(), &format!("{url}/root"), "").unwrap();
+        assert_eq!((status, body.len()), (503, 0));
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(!request.contains("authorization"), "{request}");
+    }
+
+    #[test]
+    fn the_http_client_reports_a_server_that_is_not_there() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(http_get(&http_agent(), &format!("http://127.0.0.1:{port}/root"), "").is_err());
     }
 
     #[test]
