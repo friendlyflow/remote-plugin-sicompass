@@ -25,8 +25,8 @@ configured. The plugin platform is described in
 - `Remote` is the tree logic with an injected HTTP function, tested with
   `cargo test`. `RemotePlugin` implements `sicompass_sdk::plugin::Plugin` on
   top of it and fetches with its own HTTP client (`ureq` with rustls), and
-  `src/main.rs` makes it the program. A request has 8 seconds in all, under the
-  10 seconds the app gives every call.
+  `src/main.rs` makes it the program. A request has 30 seconds in all, since
+  the app waits for the call it runs on.
 
 ## Environment (Nix)
 

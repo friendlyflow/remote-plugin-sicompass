@@ -30,10 +30,10 @@ use std::time::Duration;
 use sicompass_sdk::ffon::{FfonElement, parse_json_value};
 use sicompass_sdk::plugin::{Descriptor, Plugin, host};
 
-/// How long one request may take, all of it. The app gives up on a call after
-/// 10 seconds and ends the plugin, and a fetch makes at most one request, so
-/// a server that hangs costs an error row instead of the plugin.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long one request may take, all of it. A fetch runs on a call from the
+/// app, which waits for it, so a server that hangs becomes an error row
+/// instead of an app that waits forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `GET url` with an optional bearer key: `(status, body)`, or why not.
 pub type Get = Box<dyn Fn(&str, &str) -> Result<(u16, Vec<u8>), String>>;
