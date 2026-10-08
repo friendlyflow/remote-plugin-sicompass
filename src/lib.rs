@@ -292,6 +292,12 @@ impl Plugin for RemotePlugin {
         self.load_config();
     }
 
+    /// Each level is a blocking GET to the server, and the app waits on every
+    /// call: one unreachable server would hold scroll mode until it times out.
+    fn allows_scroll_prefetch(&self) -> bool {
+        false
+    }
+
     fn describe(&self) -> Descriptor {
         Descriptor {
             name: "remote".to_owned(),
@@ -351,6 +357,15 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// Every level is a GET the app would wait on, so scroll mode must not
+    /// fetch ahead.
+    #[test]
+    fn scroll_mode_may_not_fetch_ahead() {
+        assert!(!<RemotePlugin as Plugin>::allows_scroll_prefetch(
+            &RemotePlugin::new()
+        ));
+    }
 
     type Log = Rc<RefCell<Vec<(String, String)>>>;
 
