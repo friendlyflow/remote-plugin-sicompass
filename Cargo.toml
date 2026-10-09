@@ -3,7 +3,7 @@
 
 [package]
 name = "remote-plugin"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Remote for sicompass: browse FFON served over HTTP, as a plugin"

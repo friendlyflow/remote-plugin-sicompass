@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- Scroll mode no longer reads ahead into levels you have not opened. Each level
+  is a request to your server, so it waits until you open it.
+
 ## 0.3.0
 
 Remote is a program of its own now, instead of a sandboxed WebAssembly component.
