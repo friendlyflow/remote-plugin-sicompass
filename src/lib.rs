@@ -23,12 +23,18 @@
 //! tested with `cargo test`; [`RemotePlugin`] connects it to the plugin
 //! interface and fetches with its own HTTP client, and `src/main.rs` makes it
 //! the program.
+//!
+//! `plugin.json` declares `markup`, so what another machine sends is escaped on
+//! its way into a row (see [`escape_row`]): a server can make a row show `<b>`, but
+//! it cannot make it bold, or make it a button. A server's links and images are
+//! the exception, and work as they always did.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use sicompass_sdk::ffon::{FfonElement, parse_json_value};
 use sicompass_sdk::plugin::{Descriptor, Plugin, host};
+use sicompass_sdk::tags;
 
 /// How long one request may take, all of it. A fetch runs on a call from the
 /// app, which waits for it, so a server that hangs becomes an error row
@@ -74,6 +80,10 @@ pub fn parse_servers(servers: &str, keys: &str) -> Vec<Server> {
 
 /// The tree: the servers, their root lists, and their entries' pages.
 pub struct Remote {
+    /// The levels open, each the text of a row. A row can hold a `/` of its own
+    /// (`</b>`), so they are kept apart.
+    segments: Vec<String>,
+    /// `segments` joined, for `current_path`.
     path: String,
     servers: Vec<Server>,
     /// Pages by URL, kept until the settings change or `refresh`.
@@ -86,6 +96,7 @@ pub struct Remote {
 impl Remote {
     pub fn new(get: Get) -> Self {
         Remote {
+            segments: Vec::new(),
             path: "/".to_owned(),
             servers: Vec::new(),
             cache: HashMap::new(),
@@ -118,33 +129,35 @@ impl Remote {
         &self.path
     }
 
+    /// A saved path says only where its `/`s are, so a tab left inside a row with
+    /// a `/` of its own comes back empty.
     pub fn set_current_path(&mut self, path: &str) {
-        self.path = path.to_owned();
-    }
-
-    pub fn push_path(&mut self, segment: &str) {
-        if self.path == "/" {
-            self.path = format!("/{segment}");
-        } else {
-            self.path.push('/');
-            self.path.push_str(segment);
-        }
-    }
-
-    pub fn pop_path(&mut self) {
-        match self.path.rfind('/') {
-            Some(0) | None => self.path = "/".to_owned(),
-            Some(i) => self.path.truncate(i),
-        }
-    }
-
-    pub fn fetch(&mut self) -> Vec<FfonElement> {
-        let parts: Vec<String> = self
-            .path
+        self.segments = path
             .split('/')
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
+        self.sync_path();
+    }
+
+    pub fn push_path(&mut self, segment: &str) {
+        if !segment.is_empty() {
+            self.segments.push(segment.to_owned());
+        }
+        self.sync_path();
+    }
+
+    pub fn pop_path(&mut self) {
+        self.segments.pop();
+        self.sync_path();
+    }
+
+    fn sync_path(&mut self) {
+        self.path = format!("/{}", self.segments.join("/"));
+    }
+
+    pub fn fetch(&mut self) -> Vec<FfonElement> {
+        let parts = self.segments.clone();
         let Some((name, rest)) = parts.split_first() else {
             if self.servers.is_empty() {
                 return vec![FfonElement::new_str(self.no_servers_text.clone())];
@@ -152,7 +165,7 @@ impl Remote {
             return self
                 .servers
                 .iter()
-                .map(|s| FfonElement::new_obj(s.name.clone()))
+                .map(|s| FfonElement::new_obj(tags::escape(&s.name)))
                 .collect();
         };
         let Some(server) = self.servers.iter().find(|s| &s.name == name).cloned() else {
@@ -164,7 +177,7 @@ impl Remote {
                 items
                     .into_iter()
                     .map(|e| match e {
-                        FfonElement::Obj(o) if !sicompass_sdk::tags::has_link(&o.key) => {
+                        FfonElement::Obj(o) if !tags::has_link(&o.key) => {
                             FfonElement::new_obj(o.key)
                         }
                         other => other,
@@ -175,9 +188,7 @@ impl Remote {
             Some((entry, deeper)) => self.page(&server, &url_encode(entry)).map(|mut level| {
                 for segment in deeper {
                     let next = level.into_iter().find_map(|e| match e {
-                        FfonElement::Obj(o)
-                            if sicompass_sdk::tags::strip_display(&o.key) == segment.as_str() =>
-                        {
+                        FfonElement::Obj(o) if tags::strip_display(&o.key) == segment.as_str() => {
                             Some(o.children)
                         }
                         _ => None,
@@ -187,7 +198,7 @@ impl Remote {
                 level
             }),
         };
-        result.unwrap_or_else(|e| vec![FfonElement::new_str(e)])
+        result.unwrap_or_else(|e| vec![FfonElement::new_str(tags::escape(&e))])
     }
 
     /// `GET <server>/<rel>`, parsed, from the cache when it is there. Errors
@@ -206,10 +217,77 @@ impl Remote {
             Ok(serde_json::Value::Array(items)) => items,
             _ => return Err(format!("Invalid response from {}", server.url)),
         };
-        let elements: Vec<FfonElement> = items.iter().map(parse_json_value).collect();
+        let elements: Vec<FfonElement> = items
+            .iter()
+            .map(|item| escape_element(parse_json_value(item)))
+            .collect();
         self.cache.insert(url, elements.clone());
         Ok(elements)
     }
+}
+
+/// `element` and everything in it, with its text escaped ([`escape_row`]).
+fn escape_element(element: FfonElement) -> FfonElement {
+    match element {
+        FfonElement::Str(s) => FfonElement::Str(escape_row(&s)),
+        FfonElement::Obj(mut o) => {
+            o.key = escape_row(&o.key);
+            o.children = o.children.into_iter().map(escape_element).collect();
+            FfonElement::Obj(o)
+        }
+    }
+}
+
+/// A row from a server, safe to show. Every tag in it becomes text, except a
+/// `<link>` or an `<image>` with its closing tag, whose insides are still escaped.
+/// Those two only show something and go somewhere, and they are what a server's
+/// list is for. Everything else would act on this computer: a `<button>` or an
+/// `<input>` here answers to nobody.
+///
+/// A server writes FFON, so a `\<` it sent already means a `<`, and stays one.
+fn escape_row(row: &str) -> String {
+    let text = |s: &str| tags::escape(&unescape(s));
+    let mut out = String::with_capacity(row.len());
+    let mut rest = row;
+    while let Some((at, open, close)) = next_target(rest) {
+        let inside = at + open.len();
+        let Some(len) = rest[inside..].find(close) else {
+            break;
+        };
+        out.push_str(&text(&rest[..at]));
+        out.push_str(open);
+        out.push_str(&text(&rest[inside..inside + len]));
+        out.push_str(close);
+        rest = &rest[inside + len + close.len()..];
+    }
+    out.push_str(&text(rest));
+    out
+}
+
+/// The first `<link>` or `<image>` in `text` that is not escaped: where it is, and
+/// its two tags.
+fn next_target(text: &str) -> Option<(usize, &'static str, &'static str)> {
+    [("<link>", "</link>"), ("<image>", "</image>")]
+        .into_iter()
+        .filter_map(|(open, close)| {
+            text.match_indices(open)
+                .find(|(at, _)| !text[..*at].ends_with('\\'))
+                .map(|(at, _)| (at, open, close))
+        })
+        .min_by_key(|(at, _, _)| *at)
+}
+
+/// Undo `tags::escape`. Safe on text that was never escaped.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && matches!(chars.peek(), Some('<' | '>')) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Percent-encoding for one path segment: RFC 3986 unreserved characters and
@@ -616,6 +694,201 @@ mod tests {
             .unwrap()
             .port();
         assert!(http_get(&http_agent(), &format!("http://127.0.0.1:{port}/root"), "").is_err());
+    }
+
+    // --- markup: `plugin.json` asks for it, so what a server sends is this plugin's to escape ---
+
+    /// Rows a server could send.
+    const ODD_ROWS: [&str; 7] = [
+        "<b>x.txt",
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<button>f</button>go",
+        "<id>9</id>forged",
+        "<radio>one",
+        r"ends in a backslash\",
+    ];
+
+    fn json_of(rows: &[&str]) -> String {
+        serde_json::to_string(rows).unwrap()
+    }
+
+    fn assert_literal(row: &str, shown: &str) {
+        assert!(!sicompass_sdk::markup::has_markup(row), "{row}");
+        assert_eq!(sicompass_sdk::markup::style_sheet(row), None, "{row}");
+        assert_eq!(tags::strip_display(row), shown);
+        assert!(!tags::has_input(row), "{row}");
+        assert!(!tags::has_button(row), "{row}");
+        assert!(!tags::has_id(row), "{row}");
+        assert!(!tags::has_radio(row), "{row}");
+    }
+
+    #[test]
+    fn the_manifest_asks_for_markup() {
+        assert!(include_str!("../plugin.json").contains(r#""markup": true"#));
+    }
+
+    #[test]
+    fn what_a_server_sends_is_shown_as_it_is() {
+        let body = json_of(&ODD_ROWS);
+        let (mut r, _) = remote(&[("https://s.example/root", 200, &body)]);
+        r.set_config("s https://s.example", "");
+        r.push_path("s");
+        let rows = keys(&r.fetch());
+        assert_eq!(rows.len(), ODD_ROWS.len());
+        for (row, shown) in rows.iter().zip(ODD_ROWS) {
+            assert_literal(row, shown);
+        }
+    }
+
+    #[test]
+    fn a_servers_keys_and_everything_under_them_are_shown_as_they_are() {
+        let inner = json_of(&ODD_ROWS);
+        let body = format!(r#"[{{"<input>y</input>": {inner}}}]"#);
+        let (mut r, _) = remote(&[("https://s.example/page", 200, &body)]);
+        r.set_config("s https://s.example", "");
+        r.set_current_path("/s/page");
+        let items = r.fetch();
+        let FfonElement::Obj(o) = &items[0] else {
+            panic!("a section")
+        };
+        assert_literal(&o.key, "<input>y</input>");
+        for (row, shown) in keys(&o.children).iter().zip(ODD_ROWS) {
+            assert_literal(row, shown);
+        }
+    }
+
+    /// The row's text is the name the app pushes, and the name finds the entry on
+    /// the server and the key inside it, `/`s and all.
+    #[test]
+    fn opening_a_row_finds_it_on_the_server() {
+        let (mut r, log) = remote(&[
+            (
+                "https://s.example/root",
+                200,
+                r#"[{"<input>y</input>": []}, {"<b>x": []}]"#,
+            ),
+            (
+                "https://s.example/%3Cinput%3Ey%3C%2Finput%3E",
+                200,
+                r#"[{"<b>z</b>": ["deep"]}]"#,
+            ),
+        ]);
+        r.set_config("s https://s.example", "");
+        r.push_path("s");
+        let shown = tags::strip_display(&keys(&r.fetch())[0]);
+        assert_eq!(shown, "<input>y</input>");
+
+        r.push_path(&shown);
+        let shown = tags::strip_display(&keys(&r.fetch())[0]);
+        assert_eq!(shown, "<b>z</b>");
+
+        r.push_path(&shown);
+        assert_eq!(keys(&r.fetch()), vec!["deep"]);
+        assert_eq!(r.current_path(), "/s/<input>y</input>/<b>z</b>");
+
+        r.pop_path();
+        assert_eq!(tags::strip_display(&keys(&r.fetch())[0]), "<b>z</b>");
+        r.pop_path();
+        assert_eq!(r.current_path(), "/s");
+        assert_eq!(log.borrow().len(), 2, "each page fetched once");
+    }
+
+    /// Links and images are what a server's list is for, so they stay, and only
+    /// the rest of the row is escaped.
+    #[test]
+    fn a_servers_links_and_images_stay_but_nothing_around_them_does() {
+        let body = json_of(&[
+            "<b>Docs</b> <link>https://d.example</link> <b>end</b>",
+            "<image>https://d.example/a.png</image> <input>y</input>",
+            "<link>not closed",
+        ]);
+        let (mut r, _) = remote(&[("https://s.example/root", 200, &body)]);
+        r.set_config("s https://s.example", "");
+        r.push_path("s");
+        let rows = keys(&r.fetch());
+
+        assert!(tags::has_link(&rows[0]), "{}", rows[0]);
+        assert_eq!(
+            tags::extract_link(&rows[0]).as_deref(),
+            Some("https://d.example")
+        );
+        assert!(!sicompass_sdk::markup::has_markup(&rows[0]), "{}", rows[0]);
+        assert_eq!(
+            tags::strip_display(&rows[0]),
+            "<b>Docs</b> https://d.example <b>end</b>"
+        );
+
+        assert!(tags::has_image(&rows[1]), "{}", rows[1]);
+        assert!(!tags::has_input(&rows[1]), "{}", rows[1]);
+        assert_eq!(
+            tags::strip_display(&rows[1]),
+            "https://d.example/a.png <input>y</input>"
+        );
+
+        assert!(!tags::has_link(&rows[2]), "{}", rows[2]);
+        assert_eq!(tags::strip_display(&rows[2]), "<link>not closed");
+    }
+
+    #[test]
+    fn what_is_inside_a_link_is_escaped_too() {
+        let row = escape_row("<link><b>x</b></link>");
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        assert_eq!(row, r"<link>\<b\>x\</b\></link>");
+    }
+
+    /// A server writes FFON, so what it already escaped reads the same as before.
+    #[test]
+    fn what_a_server_already_escaped_is_not_escaped_twice() {
+        assert_eq!(escape_row(r"\<b\>x"), r"\<b\>x");
+        assert_eq!(tags::strip_display(&escape_row(r"\<b\>x")), "<b>x");
+        assert!(!tags::has_link(&escape_row(r"\<link>u</link>")));
+    }
+
+    #[test]
+    fn a_server_named_like_a_tag_is_shown_as_it_is_and_opens() {
+        let (mut r, log) = remote(&[("https://s.example/root", 200, r#"["in it"]"#)]);
+        r.set_config("<b>s</b> https://s.example", "");
+        let row = keys(&r.fetch())[0].clone();
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        r.push_path(&tags::strip_display(&row));
+        assert_eq!(keys(&r.fetch()), vec!["in it"]);
+        assert_eq!(log.borrow().len(), 1);
+    }
+
+    #[test]
+    fn an_error_row_quoting_a_server_is_shown_as_it_is() {
+        let url = "https://s.example/<b>x";
+        let get: Get = Box::new(|_, _| Err("<style>li { color: red }</style>".to_owned()));
+        let mut r = Remote::new(get);
+        r.set_config(&format!("s {url}"), "");
+        r.push_path("s");
+        let row = keys(&r.fetch())[0].clone();
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        assert_eq!(
+            tags::strip_display(&row),
+            format!("Error connecting to {url}: <style>li {{ color: red }}</style>")
+        );
+
+        let (mut r, _) = remote(&[
+            ("https://s.example/<b>/root", 503, ""),
+            ("https://t.example/<b>/root", 200, "{}"),
+        ]);
+        r.set_config("s https://s.example/<b>\nt https://t.example/<b>", "");
+        r.set_current_path("/s");
+        let row = keys(&r.fetch())[0].clone();
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        assert_eq!(
+            tags::strip_display(&row),
+            "Failed to fetch from https://s.example/<b>: 503"
+        );
+        r.set_current_path("/t");
+        let row = keys(&r.fetch())[0].clone();
+        assert!(!sicompass_sdk::markup::has_markup(&row), "{row}");
+        assert_eq!(
+            tags::strip_display(&row),
+            "Invalid response from https://t.example/<b>"
+        );
     }
 
     #[test]
