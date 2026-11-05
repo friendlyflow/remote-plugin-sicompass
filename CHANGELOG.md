@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- A server's rows are shown exactly as written except its links and pictures, and a key holding a slash opens the right page.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.1
 
 - Scroll mode no longer reads ahead into levels you have not opened. Each level
